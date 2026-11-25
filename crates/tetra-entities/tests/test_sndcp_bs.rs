@@ -72,6 +72,9 @@ fn uplink(link_id: u32, write_pdu: impl FnOnce(&mut BitBuffer)) -> SapMsg {
 fn uplink_channel_request(link_id: u32, sn_type: u64) -> SapMsg {
     uplink(link_id, |sdu| {
         sdu.write_bits(sn_type, 4);
+        if sn_type == SN_RECONNECT {
+            sdu.write_bits(1, 1); // Data to send
+        }
         sdu.write_bits(1, 4); // NSAPI
     })
 }
