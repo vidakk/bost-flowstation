@@ -261,20 +261,15 @@ impl Sndcp {
         self.send_sndcp_downlink(queue, ind, sdu, None);
     }
 
-    /// Grant (or release) the packet-data channel: emit an SN-DATA TRANSMIT RESPONSE and attach the
-    /// PDCH channel allocation. A new/refresh grant assigns the PDCH slot; an end-of-data release quits the
-    /// channel back to common control (spec §5.3).
-    fn send_pdch_grant(&self, queue: &mut MessageQueue, ind: &LtpdMleUnitdataInd, alloc: CmceChanAllocReq, label: &str) {
+    /// Grant (or release) the packet-data channel: send `sdu` (an SN-DATA TRANSMIT RESPONSE for a
+    /// grant, an SN-END OF DATA for a release) with the PDCH channel allocation attached. A new/refresh
+    /// grant assigns the PDCH slot; an end-of-data release quits the channel back to common control (spec §5.3).
+    fn send_pdch_grant(&self, queue: &mut MessageQueue, ind: &LtpdMleUnitdataInd, sdu: BitBuffer, alloc: CmceChanAllocReq, label: &str) {
         if !self.wap_enabled() {
             return;
         }
-        let mut sdu = BitBuffer::new_autoexpand(2);
-        sdu.write_bits(MLE_DISCRIMINATOR_SNDCP, 3);
-        sdu.write_bits(SN_PDU_DATA_TRANSMIT_RESPONSE, 4);
-        sdu.write_bits(0, 1); // result = accepted
-        sdu.seek(0);
         tracing::info!(
-            "SNDCP: -> SN-DATA TRANSMIT RESPONSE ({label}) to {:?}: timeslots={:?} {:?}/{:?}",
+            "SNDCP: -> {label} to {:?}: timeslots={:?} {:?}/{:?}",
             ind.received_tetra_address,
             alloc.timeslots,
             alloc.alloc_type,
@@ -364,6 +359,43 @@ fn build_downlink_unitdata_sdu(nsapi: u64, datagram: &[u8]) -> BitBuffer {
     for &byte in datagram {
         sdu.write_bits(u64::from(byte), 8);
     }
+    sdu.seek(0);
+    sdu
+}
+
+/// NSAPI the MS is asking to send on. SN-DATA TRANSMIT REQUEST carries it right after the type;
+/// SN-RECONNECT carries it after the Data-to-send bit, and only when that bit is 1 (EN 300 392-2
+/// tables 28.30 and 28.42). `pdu` is the SN-PDU bit-string after the MLE discriminator.
+fn requested_nsapi(pdu: &str) -> Option<u64> {
+    let bits = |off: usize, n: usize| pdu.get(off..off + n).and_then(|s| u64::from_str_radix(s, 2).ok());
+    match bits(0, 4)? as u8 {
+        SN_PDU_DATA_TRANSMIT_REQUEST => bits(4, 4),
+        SN_PDU_RECONNECT if bits(4, 1)? == 1 => bits(5, 4),
+        _ => None,
+    }
+}
+
+/// SN-DATA TRANSMIT RESPONSE accepting `nsapi` (EN 300 392-2 table 28.31): type(4) NSAPI(4)
+/// Accept/Reject(1)=1, no reject cause, O-bit=0.
+fn build_transmit_response_sdu(nsapi: u64) -> BitBuffer {
+    let mut sdu = BitBuffer::new_autoexpand(2);
+    sdu.write_bits(MLE_DISCRIMINATOR_SNDCP, 3);
+    sdu.write_bits(SN_PDU_DATA_TRANSMIT_RESPONSE, 4);
+    sdu.write_bits(nsapi, 4);
+    sdu.write_bits(1, 1); // Accept/Reject: 1 = accepted
+    sdu.write_bits(0, 1); // O-bit
+    sdu.seek(0);
+    sdu
+}
+
+/// SN-END OF DATA answering the MS's own (EN 300 392-2 table 28.34): type(4) Immediate service
+/// change(1)=0, O-bit=0.
+fn build_end_of_data_sdu() -> BitBuffer {
+    let mut sdu = BitBuffer::new_autoexpand(2);
+    sdu.write_bits(MLE_DISCRIMINATOR_SNDCP, 3);
+    sdu.write_bits(u64::from(SN_PDU_END_OF_DATA), 4);
+    sdu.write_bits(0, 1); // Immediate service change
+    sdu.write_bits(0, 1); // O-bit
     sdu.seek(0);
     sdu
 }
@@ -510,16 +542,24 @@ impl TetraEntityTrait for Sndcp {
         match sn_type {
             Some(t) if t == SN_PDU_ACTIVATE_PDP_CONTEXT as u8 => self.send_pdp_accept(queue, ind, pdu),
             Some(SN_PDU_DATA_TRANSMIT_REQUEST) => {
-                self.send_pdch_grant(queue, ind, pdch_allocation_for_data_transmit_response(), "assign PDCH");
+                let nsapi = requested_nsapi(pdu).unwrap_or(1);
+                let sdu = build_transmit_response_sdu(nsapi);
+                let label = format!("SN-DATA TRANSMIT RESPONSE (accept NSAPI={nsapi}, assign PDCH)");
+                self.send_pdch_grant(queue, ind, sdu, pdch_allocation_for_data_transmit_response(), &label);
             }
             Some(SN_PDU_RECONNECT) => {
                 // The MS changed cell with data outstanding and asks to carry on here (clause
                 // 28.3.4). Contexts are not tied to a cell, so the answer is the same as for a
-                // fresh transmit request: accept and assign this cell's PDCH.
-                self.send_pdch_grant(queue, ind, pdch_allocation_for_data_transmit_response(), "reconnect, assign PDCH");
+                // fresh transmit request: accept and assign this cell's PDCH. With Data to send = 0
+                // no response is expected.
+                if let Some(nsapi) = requested_nsapi(pdu) {
+                    let sdu = build_transmit_response_sdu(nsapi);
+                    let label = format!("SN-DATA TRANSMIT RESPONSE (reconnect, accept NSAPI={nsapi}, assign PDCH)");
+                    self.send_pdch_grant(queue, ind, sdu, pdch_allocation_for_data_transmit_response(), &label);
+                }
             }
             Some(SN_PDU_END_OF_DATA) => {
-                self.send_pdch_grant(queue, ind, pdch_allocation_for_end_of_data(), "release PDCH");
+                self.send_pdch_grant(queue, ind, build_end_of_data_sdu(), pdch_allocation_for_end_of_data(), "SN-END OF DATA (release PDCH)");
             }
             Some(t) if t == SN_PDU_UNITDATA as u8 || t == SN_PDU_DATA => self.handle_wap_data(queue, ind, pdu),
             Some(SN_PDU_DEACTIVATE_DEMAND) => {
@@ -634,6 +674,33 @@ mod tests {
         assert_eq!(&bits[11..15], "0000", "PCOMP = 0");
         assert_eq!(&bits[15..19], "0000", "DCOMP = 0");
         assert_eq!(&bits[19..27], "01000101", "first N-PDU octet 0x45");
+    }
+
+    // ---- SN-DATA TRANSMIT RESPONSE / SN-END OF DATA framing ----
+
+    #[test]
+    fn requested_nsapi_from_captured_transmit_request() {
+        // SN-DATA TRANSMIT REQUEST from an MXP600 (after the MLE discriminator): type 6, NSAPI 1.
+        assert_eq!(requested_nsapi("011000010101111111110"), Some(1));
+    }
+
+    #[test]
+    fn requested_nsapi_from_reconnect_only_with_data_to_send() {
+        assert_eq!(requested_nsapi("100110011"), Some(3)); // type 9, Data to send 1, NSAPI 3
+        assert_eq!(requested_nsapi("10010"), None);
+        assert_eq!(requested_nsapi("0101"), None); // SN-DATA is not a request
+    }
+
+    #[test]
+    fn transmit_response_accepts_and_echoes_nsapi() {
+        let bits = build_transmit_response_sdu(1).dump_bin_unformatted();
+        assert_eq!(bits, "1000111000110");
+    }
+
+    #[test]
+    fn end_of_data_reply_frames_type8() {
+        let bits = build_end_of_data_sdu().dump_bin_unformatted();
+        assert_eq!(bits, "100100000");
     }
 
     // ---- WAP gateway core (§5) ----
