@@ -37,6 +37,10 @@ pub const MACSCHED_TX_AHEAD: usize = 1;
 // We schedule up to this many frames ahead
 pub const MACSCHED_NUM_FRAMES: usize = 18;
 
+/// Full-slot counts the basic slot granting "capacity allocation" element can express exactly,
+/// largest first.
+const GRANTABLE_SLOT_COUNTS: [usize; 14] = [68, 51, 34, 24, 17, 13, 10, 8, 6, 5, 4, 3, 2, 1];
+
 /// Largest granting delay representable in the 4-bit basic slot granting delay field
 /// (EN 300 392-2 cl. 21.5.6); 14 and 15 are reserved codes.
 pub const MAX_GRANTING_DELAY_OPPORTUNITIES: usize = 13;
@@ -64,6 +68,21 @@ const PDCH_MOVE_GRACE_FRAMES: u32 = 18;
 struct PdchMs {
     ssi: u32,
     ts: u8,
+    frames_left: u32,
+    /// Frames since the MS was sent to the channel.
+    frames_on: u32,
+}
+
+/// How long a reservation requirement held back during a reservation stays pending (~2 s). Longer
+/// than an MS waits on a packet data channel before falling back to the MCCH.
+const PENDING_CAP_REQ_FRAMES: u32 = 36;
+
+/// A reservation requirement held back because the MS still had reserved slots ahead.
+#[derive(Debug, Clone, Copy)]
+struct PendingCapReq {
+    ts: u8,
+    addr: TetraAddress,
+    res_req: ReservationRequirement,
     frames_left: u32,
 }
 
@@ -179,6 +198,11 @@ pub struct BsChannelScheduler {
     /// listed here its slot is advertised as assigned control in the AACH, and everything addressed
     /// to that MS goes out there instead of on the MCCH, which it is no longer listening to.
     pdch_ms: Vec<PdchMs>,
+
+    /// Requirements held back until the MS's current reservation runs out, then granted without
+    /// waiting for another MAC-DATA: the MS does not use every reserved slot, so the one that
+    /// would have carried the requirement may never come.
+    pending_cap_reqs: Vec<PendingCapReq>,
 
     /// Per-timeslot rotating cursor for allocating usage markers to multi-slot
     /// uplink reservations. Wraps in the valid range [4, 62] (0 = unallocated,
@@ -378,6 +402,7 @@ impl BsChannelScheduler {
             cipher: None,
             tch_encrypted: [false; 4],
             pdch_ms: Vec::new(),
+            pending_cap_reqs: Vec::new(),
             tch_dl_address: [None; 4],
             tch_ul_issi: [None; 4],
             // Start each timeslot's marker cursor at 4 (first valid value).
@@ -476,6 +501,7 @@ impl BsChannelScheduler {
             ssi,
             ts,
             frames_left: PDCH_HOLD_FRAMES,
+            frames_on: 0,
         });
         tracing::info!("BsChannelScheduler: ISSI {} on packet data channel ts {}", ssi, ts);
     }
@@ -484,6 +510,7 @@ impl BsChannelScheduler {
     pub fn pdch_leave(&mut self, ssi: u32) {
         let before = self.pdch_ms.len();
         self.pdch_ms.retain(|m| m.ssi != ssi);
+        self.ul_clear_cap_req(ssi);
         if self.pdch_ms.len() != before {
             tracing::info!("BsChannelScheduler: ISSI {} left its packet data channel", ssi);
         }
@@ -512,7 +539,7 @@ impl BsChannelScheduler {
                 let settled = self
                     .pdch_ms
                     .iter()
-                    .any(|m| m.ssi == ssi && m.frames_left + PDCH_MOVE_GRACE_FRAMES <= PDCH_HOLD_FRAMES);
+                    .any(|m| m.ssi == ssi && m.frames_on >= PDCH_MOVE_GRACE_FRAMES);
                 if settled {
                     self.pdch_leave(ssi);
                 }
@@ -525,6 +552,7 @@ impl BsChannelScheduler {
     fn pdch_age_one_frame(&mut self) {
         for m in self.pdch_ms.iter_mut() {
             m.frames_left = m.frames_left.saturating_sub(1);
+            m.frames_on = m.frames_on.saturating_add(1);
         }
         self.pdch_ms.retain(|m| {
             if m.frames_left == 0 {
@@ -744,6 +772,50 @@ impl BsChannelScheduler {
         None
     }
 
+    /// Forget a held-back reservation requirement, e.g. once the MS sends without one.
+    pub fn ul_clear_cap_req(&mut self, ssi: u32) {
+        self.pending_cap_reqs.retain(|p| p.addr.ssi != ssi);
+    }
+
+    /// Grant held-back requirements whose MS has run out of reserved slots, and age the rest once
+    /// per frame.
+    fn ul_serve_pending_cap_reqs(&mut self) {
+        if self.cur_dltime.t == 1 {
+            for p in self.pending_cap_reqs.iter_mut() {
+                p.frames_left = p.frames_left.saturating_sub(1);
+            }
+            self.pending_cap_reqs.retain(|p| p.frames_left > 0);
+        }
+        let due: Vec<PendingCapReq> = self
+            .pending_cap_reqs
+            .iter()
+            .filter(|p| self.ul_reserved_ahead(p.ts, p.addr.ssi) == 0)
+            .copied()
+            .collect();
+        for p in due {
+            if let Some((grant, usage_marker)) = self.ul_process_cap_req(p.ts, p.addr, &p.res_req) {
+                tracing::debug!("ul_serve_pending_cap_reqs: {} ran out of reserved slots, granting {:?}", p.addr, grant);
+                self.dl_enqueue_grant(p.ts, p.addr, grant, usage_marker);
+            }
+        }
+    }
+
+    /// Number of full uplink slots on timeslot `t` already reserved for `ssi` from the first slot a
+    /// new grant could reach onwards. The window matches `ul_find_grant_opportunity`, so it never
+    /// sees a slot whose uplink has already gone by.
+    fn ul_reserved_ahead(&self, t: u8, ssi: u32) -> usize {
+        let ahead = MACSCHED_TX_AHEAD as i32 + if self.dl_built_this_tick { 1 } else { 0 };
+        let first_opportunity = self.cur_dltime.add_timeslots(ahead).forward_to_timeslot(t);
+        (0..MACSCHED_NUM_FRAMES - 1)
+            .map(|dist| first_opportunity.add_timeslots(dist as i32 * 4))
+            .filter(|ts| ts.f != 18)
+            .filter(|ts| {
+                let elem = &self.ulsched[t as usize - 1][self.ul_ts_to_sched_index(ts)];
+                elem.ul1 == Some(ssi) && elem.ul2 == Some(ssi)
+            })
+            .count()
+    }
+
     /// Reserves all slots designated in a grant option
     /// If only one halfslot is needed, returns 1 or 2 designating which slot was reserved
     pub fn ul_reserve_grant(&mut self, ssi: u32, grant_timestamps: Vec<TdmaTime>, is_halfslot: bool, usage_marker: Option<u8>) -> u8 {
@@ -793,10 +865,48 @@ impl BsChannelScheduler {
         res_req: &ReservationRequirement,
     ) -> Option<(BasicSlotgrant, Option<u8>)> {
         let is_halfslot = res_req == &ReservationRequirement::Req1Subslot;
-        let requested_cap = if is_halfslot { 1 } else { res_req.to_req_slotcount() };
+        let wanted_cap = if is_halfslot { 1 } else { res_req.to_req_slotcount() };
 
-        // Find a suitable grant opportunity
-        let grant_op = self.ul_find_grant_opportunity(timeslot, requested_cap, is_halfslot);
+        // The requirement is the MS's total need, "irrespective of whether or not the MS has already
+        // been granted some future slots" (EN 300 392-2 clause 23.5.2.1 note 1), and the MS repeats it
+        // in every MAC-DATA. A grant sent while it is still working through a reservation was not used
+        // by the radios seen so far, so hold the requirement and grant once the reservation runs out.
+        let reserved_ahead = self.ul_reserved_ahead(timeslot, addr.ssi);
+        if !is_halfslot && reserved_ahead > 0 {
+            tracing::debug!(
+                "ul_process_cap_req: {} asks for {} slots with {} still reserved, granting when they run out",
+                addr,
+                wanted_cap,
+                reserved_ahead
+            );
+            self.ul_clear_cap_req(addr.ssi);
+            self.pending_cap_reqs.push(PendingCapReq {
+                ts: timeslot,
+                addr,
+                res_req: *res_req,
+                frames_left: PENDING_CAP_REQ_FRAMES,
+            });
+            return None;
+        }
+
+        // Find a suitable grant opportunity. When the full request does not fit (a long packet data
+        // burst asks for more contiguous slots than the schedule holds, frame 18 breaking every run),
+        // grant the largest encodable capacity that does: the MS sends what fits and states what it
+        // still needs in the "reservation requirement" of its next MAC-DATA or MAC-END.
+        let mut requested_cap = wanted_cap;
+        let mut grant_op = self.ul_find_grant_opportunity(timeslot, requested_cap, is_halfslot);
+        if !is_halfslot && grant_op.as_ref().is_none_or(|(skips, _)| *skips > MAX_GRANTING_DELAY_OPPORTUNITIES) {
+            for &cap in GRANTABLE_SLOT_COUNTS.iter().filter(|&&c| c < wanted_cap) {
+                if let Some(op) = self.ul_find_grant_opportunity(timeslot, cap, false)
+                    && op.0 <= MAX_GRANTING_DELAY_OPPORTUNITIES
+                {
+                    tracing::debug!("ul_process_cap_req: {} asked for {} slots, granting {}", addr, wanted_cap, cap);
+                    requested_cap = cap;
+                    grant_op = Some(op);
+                    break;
+                }
+            }
+        }
 
         tracing::debug!(
             "ul_process_cap_req: addr {}, res_req {:?}, requested_cap {}, is_halfslot {}, grant_op: {:?}",
@@ -809,6 +919,7 @@ impl BsChannelScheduler {
 
         // If found, reserve the slots and return a BasicSlotgrant + optional usage_marker.
         if let Some((skips, grant_timestamps)) = grant_op {
+            self.ul_clear_cap_req(addr.ssi);
             // Granting delay is a 4-bit field with valid N of 1..13 (EN 300 392-2 cl. 21.5.6):
             // 14/15 are reserved codes and >=16 truncates. Telling the MS a wrong transmit time
             // is worse than not granting, so defer -- the MS repeats its capacity request.
@@ -1792,6 +1903,9 @@ impl BsChannelScheduler {
             self.cur_dltime,
             ts
         );
+        if !self.pending_cap_reqs.is_empty() {
+            self.ul_serve_pending_cap_reqs();
+        }
     }
 
     /// Prepares a scheduled FUTURE timeslot for transfer to lmac and transmission
@@ -2959,6 +3073,67 @@ mod tests {
         assert_eq!(sched.ul_get_slot_owner(frame1, PhyBlockNum::Block1), Some(1002));
     }
 
+    /// A packet data MS on a PDCH asks for 17 slots (seen from an MXP600). The schedule can't hold
+    /// 17 contiguous slots across frame 18, so the largest exactly encodable grant that fits is given.
+    #[test]
+    fn test_oversized_request_gets_largest_grant_that_fits() {
+        let mut sched = get_testing_slotter();
+        sched.set_dl_time(TdmaTime { t: 1, f: 5, m: 1, h: 0 });
+        let addr = TetraAddress { ssi_type: SsiType::Issi, ssi: 2200279 };
+        let (grant, marker) = sched.ul_process_cap_req(4, addr, &ReservationRequirement::Req17Slots).expect("a partial grant");
+        // Frames 5..=17 of timeslot 4 are free before frame 18 breaks the run: 13 slots.
+        assert_eq!(grant.capacity_allocation, BasicSlotgrantCapAlloc::Grant13Slots);
+        assert_eq!(grant.granting_delay, BasicSlotgrantGrantingDelay::CapAllocAtNextOpportunity);
+        assert!(marker.is_some());
+        let owned = (1..=18u8)
+            .filter(|&f| sched.ul_get_slot_owner(TdmaTime { t: 4, f, m: 1, h: 0 }, PhyBlockNum::Block1) == Some(2200279))
+            .count();
+        assert_eq!(owned, 13);
+    }
+
+    /// Field case (MXP600 WAP request, 2026-11-25): the MS repeats its reservation requirement in
+    /// every MAC-DATA of a reservation but does not use every reserved slot. Grants sent back in
+    /// the middle of it were never used, and when it skipped its last slot no requirement came
+    /// after the reservation ran out, so the held-back requirement is granted without one.
+    #[test]
+    fn test_held_back_requirement_is_granted_once_the_reservation_runs_out() {
+        let mut sched = get_testing_slotter();
+        sched.set_dl_time(TdmaTime { t: 1, f: 5, m: 1, h: 0 });
+        let addr = TetraAddress { ssi_type: SsiType::Issi, ssi: 2200279 };
+        assert!(sched.ul_process_cap_req(4, addr, &ReservationRequirement::Req17Slots).is_some());
+        assert!(
+            sched.ul_process_cap_req(4, addr, &ReservationRequirement::Req13Slots).is_none(),
+            "still 13 slots reserved"
+        );
+
+        let mut ticks = 0;
+        while !sched.pending_cap_reqs.is_empty() {
+            let next = sched.cur_dltime.add_timeslots(1);
+            sched.tick_start(next);
+            let _ = sched.finalize_ts_for_tick();
+            ticks += 1;
+            assert!(ticks < 4 * 18, "the held-back requirement was never granted");
+        }
+        assert!(ticks > 4 * 8, "granted only after the 13-slot reservation ran out, not after {ticks} ticks");
+        assert!(sched.ul_reserved_ahead(4, addr.ssi) > 0, "a new reservation is in place");
+    }
+
+    #[test]
+    fn test_held_back_requirement_is_dropped_when_the_ms_has_nothing_more() {
+        let mut sched = get_testing_slotter();
+        sched.set_dl_time(TdmaTime { t: 1, f: 5, m: 1, h: 0 });
+        let addr = TetraAddress { ssi_type: SsiType::Issi, ssi: 2200279 };
+        assert!(sched.ul_process_cap_req(4, addr, &ReservationRequirement::Req17Slots).is_some());
+        assert!(sched.ul_process_cap_req(4, addr, &ReservationRequirement::Req13Slots).is_none());
+        sched.ul_clear_cap_req(addr.ssi);
+        for _ in 0..4 * 18 {
+            let next = sched.cur_dltime.add_timeslots(1);
+            sched.tick_start(next);
+            let _ = sched.finalize_ts_for_tick();
+        }
+        assert_eq!(sched.ul_reserved_ahead(4, addr.ssi), 0, "nothing granted after the MS said it was done");
+    }
+
     #[test]
     fn test_dl_tma_gssi_routes_to_mcch() {
         let mut sched = get_testing_slotter();
@@ -3182,7 +3357,6 @@ mod tests {
         let other = aach_for_ts(&mut sched, 3);
         assert_eq!(other.dl_usage, AccessAssignDlUsage::Unallocated, "only the PDCH slot changes");
     }
-
     #[test]
     fn test_signalling_follows_an_ms_onto_its_pdch() {
         let mut sched = get_testing_slotter();
@@ -3250,6 +3424,9 @@ mod tests {
         for _ in 0..PDCH_MOVE_GRACE_FRAMES {
             sched.pdch_age_one_frame();
         }
+        // Heard on its PDCH just before falling back: the grace runs from the move, not from that.
+        sched.dl_enqueue_random_access_ack(4, PDCH_MS);
+        sched.pdch_age_one_frame();
         sched.dl_enqueue_random_access_ack(1, PDCH_MS);
         assert_eq!(sched.pdch_of(PDCH_MS.ssi), None, "once settled, an MCCH uplink means it went back");
     }

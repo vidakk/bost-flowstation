@@ -794,8 +794,10 @@ impl UmacBs {
                 self.scheduler_for_mut(carrier_num)
                     .dl_enqueue_grant(msg_dltime.t, addr, grant, usage_marker);
             } else {
-                tracing::warn!("rx_mac_data: No grant for reservation request {:?}", res_req);
+                tracing::debug!("rx_mac_data: No grant for reservation request {:?}", res_req);
             }
+        } else {
+            self.scheduler_for_mut(carrier_num).ul_clear_cap_req(addr.ssi);
         };
 
         tracing::debug!("rx_mac_data: {}", prim.pdu.dump_bin_full(true));
@@ -1018,7 +1020,7 @@ impl UmacBs {
                         .dl_enqueue_grant_random_access_ack(msg_dltime.t, addr);
                 }
             } else {
-                tracing::warn!("rx_mac_access: No grant for reservation request {:?}", res_req);
+                tracing::debug!("rx_mac_access: No grant for reservation request {:?}", res_req);
             }
         };
 
@@ -1307,7 +1309,7 @@ impl UmacBs {
                 self.scheduler_for_mut(carrier_num)
                     .dl_enqueue_grant(msg_dltime.t, defragbuf.addr, grant, usage_marker);
             } else {
-                tracing::warn!("rx_mac_end_ul: No grant for reservation request {:?}", res_req);
+                tracing::debug!("rx_mac_end_ul: No grant for reservation request {:?}", res_req);
             }
         };
 
@@ -1436,7 +1438,7 @@ impl UmacBs {
                 self.scheduler_for_mut(carrier_num)
                     .dl_enqueue_grant(msg_dltime.t, defragbuf.addr, grant, usage_marker);
             } else {
-                tracing::warn!("rx_mac_end_hu: No grant for reservation request {:?}", res_req);
+                tracing::debug!("rx_mac_end_hu: No grant for reservation request {:?}", res_req);
             }
         };
 
