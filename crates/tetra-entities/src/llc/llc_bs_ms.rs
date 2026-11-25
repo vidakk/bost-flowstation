@@ -11,6 +11,7 @@ use tetra_saps::tla::{TlaTlDataIndBl, TlaTlUnitdataIndBl};
 use tetra_saps::tma::TmaUnitdataReq;
 use tetra_saps::{SapMsg, SapMsgInner};
 
+use crate::llc::components::advanced_link::{self, AlDisc, AlReceiver, AlReconnect, AlSegment, AlSender, AlSetup};
 use crate::llc::components::fcs;
 use tetra_core::frames;
 use tetra_pdus::llc::consts::consts::N252_BL_MAX_TLSDU_RETRANSMITS_ACKED;
@@ -88,7 +89,16 @@ pub struct Llc {
 
     /// Per-link send sequence variable per SSI. Alternates between 0 and 1.
     link_send_seq: HashMap<u32, u8>,
+
+    /// Original acknowledged advanced links set up by MSs, per SSI, with the time last heard.
+    advanced_links: HashMap<u32, (AlReceiver, TdmaTime)>,
+    /// Sending side of those links, per SSI, with the carrier and encryption to send on.
+    al_senders: HashMap<u32, (AlSender, u16, bool)>,
 }
+
+/// An advanced link not heard from for this long (in timeslots, about 60 s) is dropped. The MS sets
+/// it up again when it next has data to send.
+const ADVANCED_LINK_IDLE_TIMESLOTS: i32 = 4 * 18 * 60;
 
 impl Llc {
     pub fn new(config: SharedConfig) -> Self {
@@ -99,6 +109,8 @@ impl Llc {
             outbound_messages: VecDeque::new(),
             outbound_udata_messages: VecDeque::new(),
             link_send_seq: HashMap::new(),
+            advanced_links: HashMap::new(),
+            al_senders: HashMap::new(),
         }
     }
 
@@ -310,6 +322,19 @@ impl Llc {
             .unwrap_or_else(|| self.default_encrypted(prim.main_address) as _));
 
         let preferred_carrier = self.preferred_carrier(prim.stealing_slot, prim.chan_alloc.as_ref());
+
+        // An answer to a TL-SDU that came over an advanced link goes back over it (clause 28.3.3a).
+        if advanced_link::is_advanced_link_id(prim.link_id) && self.advanced_links.contains_key(&prim.main_address.ssi) {
+            let addr = prim.main_address;
+            let encrypted = prim.air_interface_encryption.unwrap_or(0) != 0;
+            let sdu = prim.tl_sdu.dump_bin_unformatted();
+            tracing::debug!(ts=%self.dltime, "-> TL-SDU to {} over advanced link ({} bits)", addr, sdu.len());
+            let entry = self.al_senders.entry(addr.ssi).or_insert_with(|| (AlSender::default(), preferred_carrier, encrypted));
+            (entry.1, entry.2) = (preferred_carrier, encrypted);
+            let pdus = entry.0.push(sdu);
+            self.queue_al_pdus(addr, pdus);
+            return;
+        }
 
         // Traffic-channel responses may carry the TL-SDU on the BL-ACK itself.
         // This is required for U-Alert and other BL response payloads.
@@ -540,12 +565,11 @@ impl Llc {
                 self.rx_tma_unitdata_ind_bl(queue, message);
             }
 
-            LlcPduType::AlSetup
-            | LlcPduType::AlDataAlFinal
-            | LlcPduType::AlAlUdataAlUfinal
-            | LlcPduType::AlAckAlRnr
-            | LlcPduType::AlReconnect
-            | LlcPduType::AlDisc => {
+            LlcPduType::AlSetup | LlcPduType::AlDataAlFinal | LlcPduType::AlReconnect | LlcPduType::AlDisc | LlcPduType::AlAckAlRnr => {
+                self.rx_tma_unitdata_ind_al(queue, message, pdu_type);
+            }
+
+            LlcPduType::AlAlUdataAlUfinal => {
                 unimplemented_log!("LlcPduType Advanced Link: {}", pdu_type);
             }
 
@@ -554,6 +578,224 @@ impl Llc {
                 return;
             }
         }
+    }
+
+    /// Original acknowledged advanced link, receiving side (clause 22.3.3): accept the set-up,
+    /// re-assemble and acknowledge segments, deliver TL-SDUs to MLE, answer disconnect and reconnect.
+    fn rx_tma_unitdata_ind_al(&mut self, queue: &mut MessageQueue, mut message: SapMsg, pdu_type: LlcPduType) {
+        let SapMsgInner::TmaUnitdataInd(prim) = &mut message.msg else {
+            tracing::error!("BUG: unexpected message or state -- routing error");
+            return;
+        };
+        let Some(pdu) = prim.pdu.take() else {
+            return;
+        };
+        let bits = pdu.dump_bin_unformatted();
+        let body = bits.get(4..).unwrap_or("");
+        let addr = prim.main_address;
+        let (carrier, encrypted) = (prim.carrier_num, prim.air_interface_encryption);
+
+        match pdu_type {
+            LlcPduType::AlSetup => {
+                let Some(setup) = AlSetup::parse(body) else {
+                    tracing::warn!("Failed parsing AL-SETUP from {}: {}", addr, bits);
+                    return;
+                };
+                tracing::debug!(ts=%self.dltime, "<- AL-SETUP from {}: {:?}", addr, setup);
+                if !setup.acknowledged {
+                    unimplemented_log!("AL-SETUP for the unacknowledged advanced link from {}", addr);
+                    return;
+                }
+                if setup.report == advanced_link::SetupReport::Success {
+                    // The radio confirming our single-slot counter-offer (clause 22.3.3.1.1 f).
+                    tracing::info!("advanced link {} for {} confirmed: window {}", setup.link + 1, addr, setup.window);
+                    self.advanced_links.insert(addr.ssi, (AlReceiver::new(setup), self.dltime));
+                    let pdus = self.al_senders.get_mut(&addr.ssi).map(|e| e.0.reset()).unwrap_or_default();
+                    self.queue_al_pdus(addr, pdus);
+                    return;
+                }
+                // A set-up on an existing link resets it (clause 22.3.3.1.3).
+                let offer = setup.asks_for_multislot();
+                let (reply, outcome) = if offer {
+                    (setup.single_slot_offer_pdu(), "offered a single-slot connection")
+                } else {
+                    (setup.accept_pdu(), "accepted")
+                };
+                tracing::info!(
+                    "advanced link {} for {} {}: window {}, max TL-SDU code {}{}",
+                    setup.link + 1,
+                    addr,
+                    outcome,
+                    setup.window,
+                    setup.max_sdu_len_code,
+                    if self.advanced_links.contains_key(&addr.ssi) { " (reset)" } else { "" },
+                );
+                self.advanced_links.insert(addr.ssi, (AlReceiver::new(setup), self.dltime));
+                self.queue_al_pdu(addr, carrier, encrypted != 0, reply);
+                // Data waits for the radio's "success" when we made a counter-offer.
+                let pdus = self.al_senders.get_mut(&addr.ssi).map(|e| e.0.reset()).unwrap_or_default();
+                if !offer {
+                    self.queue_al_pdus(addr, pdus);
+                }
+            }
+
+            LlcPduType::AlDataAlFinal => {
+                let Some(seg) = AlSegment::parse(body) else {
+                    tracing::warn!("Failed parsing AL-DATA/AL-FINAL from {}: {}", addr, bits);
+                    return;
+                };
+                tracing::debug!(ts=%self.dltime, "<- AL-{}{} from {}: N(S) {} S(S) {} ({} bits)",
+                    if seg.last { "FINAL" } else { "DATA" }, if seg.ack_request { "-AR" } else { "" },
+                    addr, seg.ns, seg.ss, seg.payload.len());
+                let dltime = self.dltime;
+                let Some((link, last_heard)) = self.advanced_links.get_mut(&addr.ssi) else {
+                    tracing::info!("AL-DATA from {} without an advanced link, discarding", addr);
+                    return;
+                };
+                *last_heard = dltime;
+                let link_id = advanced_link::ADVANCED_LINK_ID_BASE + link.setup.link as u32;
+                let out = link.receive(seg);
+                if out.fcs_failed {
+                    tracing::info!("advanced link TL-SDU from {} failed its FCS, asking for it again", addr);
+                }
+                for sdu in out.delivered {
+                    tracing::debug!("advanced link TL-SDU from {} complete ({} bits)", addr, sdu.len());
+                    queue.push_back(SapMsg {
+                        sap: Sap::TlaSap,
+                        src: TetraEntity::Llc,
+                        dest: TetraEntity::Mle,
+                        msg: SapMsgInner::TlaTlDataIndBl(TlaTlDataIndBl {
+                            rx_ack: None,
+                            main_address: addr,
+                            link_id,
+                            endpoint_id: prim.endpoint_id,
+                            new_endpoint_id: prim.new_endpoint_id,
+                            css_endpoint_id: prim.css_endpoint_id,
+                            tl_sdu: Some(BitBuffer::from_bitstr(&sdu)),
+                            scrambling_code: prim.scrambling_code,
+                            fcs_flag: true,
+                            air_interface_encryption: encrypted,
+                            chan_change_resp_req: prim.chan_change_response_req,
+                            chan_change_handle: prim.chan_change_handle,
+                            chan_info: prim.chan_info.clone(),
+                            req_handle: 0,
+                        }),
+                    });
+                }
+                if let Some(ack) = out.ack {
+                    tracing::debug!(ts=%self.dltime, "-> AL-ACK to {}: {}", addr, ack);
+                    self.queue_al_pdu(addr, carrier, encrypted != 0, BitBuffer::from_bitstr(&ack));
+                }
+            }
+
+            LlcPduType::AlDisc => {
+                let Some(disc) = AlDisc::parse(body) else {
+                    tracing::warn!("Failed parsing AL-DISC from {}: {}", addr, bits);
+                    return;
+                };
+                tracing::info!("advanced link {} for {} disconnected (report {})", disc.link + 1, addr, disc.report);
+                self.advanced_links.remove(&addr.ssi);
+                self.al_senders.remove(&addr.ssi);
+                // "Close" is confirmed with "success" (clause 22.3.3.3), also when no link exists.
+                if disc.report == advanced_link::DISC_CLOSE {
+                    let reply = AlDisc { report: advanced_link::DISC_SUCCESS, ..disc }.to_pdu();
+                    self.queue_al_pdu(addr, carrier, encrypted != 0, reply);
+                }
+            }
+
+            LlcPduType::AlReconnect => {
+                let Some(rc) = AlReconnect::parse(body) else {
+                    tracing::warn!("Failed parsing AL-RECONNECT from {}: {}", addr, bits);
+                    return;
+                };
+                if rc.report != advanced_link::RECONNECT_PROPOSE {
+                    return;
+                }
+                let known = self.advanced_links.get(&addr.ssi).is_some_and(|entry| entry.0.setup.link == rc.link);
+                tracing::info!("advanced link {} reconnect from {}: {}", rc.link + 1, addr, if known { "accept" } else { "reject" });
+                let report = if known { advanced_link::RECONNECT_ACCEPT } else { advanced_link::RECONNECT_REJECT };
+                self.queue_al_pdu(addr, carrier, encrypted != 0, AlReconnect { report, ..rc }.to_pdu());
+                if known {
+                    let pdus = self.al_senders.get_mut(&addr.ssi).map(|e| e.0.resend()).unwrap_or_default();
+                    self.queue_al_pdus(addr, pdus);
+                }
+            }
+
+            LlcPduType::AlAckAlRnr => {
+                tracing::debug!(ts=%self.dltime, "<- AL-{} from {}: {}", if body.starts_with('1') { "ACK" } else { "RNR" }, addr, body);
+                if let Some((_, last_heard)) = self.advanced_links.get_mut(&addr.ssi) {
+                    *last_heard = self.dltime;
+                }
+                let pdus = self.al_senders.get_mut(&addr.ssi).map(|e| e.0.on_ack(body)).unwrap_or_default();
+                self.queue_al_pdus(addr, pdus);
+            }
+
+            _ => {}
+        }
+    }
+
+    /// Queue an advanced link PDU to the MS. It goes on whichever channel the MS is on (the MAC
+    /// routes an MS on a packet data channel there).
+    fn queue_al_pdu(&mut self, addr: TetraAddress, carrier_num: u16, encrypted: bool, pdu: BitBuffer) {
+        self.outbound_udata_messages.push_back(SapMsg {
+            sap: Sap::TmaSap,
+            src: TetraEntity::Llc,
+            dest: TetraEntity::Umac,
+            msg: SapMsgInner::TmaUnitdataReq(TmaUnitdataReq {
+                carrier_num: Some(carrier_num),
+                req_handle: 0,
+                pdu,
+                main_address: addr,
+                link_id: 0,
+                endpoint_id: 0,
+                stealing_permission: false,
+                subscriber_class: 0,
+                air_interface_encryption: Some(encrypted as _),
+                stealing_repeats_flag: None,
+                data_category: None,
+                chan_alloc: None,
+                stealing_slot: None,
+                tx_reporter: None,
+            }),
+        });
+    }
+
+    /// Queue PDUs from the advanced link sender for `addr`.
+    fn queue_al_pdus(&mut self, addr: TetraAddress, pdus: Vec<String>) {
+        let Some(&(_, carrier, encrypted)) = self.al_senders.get(&addr.ssi) else {
+            return;
+        };
+        for pdu in pdus {
+            tracing::debug!(ts=%self.dltime, "-> AL-{} to {}: {}", if &pdu[4..5] == "1" { "FINAL-AR" } else { "DATA" }, addr, &pdu[..17]);
+            self.queue_al_pdu(addr, carrier, encrypted, BitBuffer::from_bitstr(&pdu));
+        }
+    }
+
+    fn tick_al_senders(&mut self) {
+        let due: Vec<(u32, Vec<String>)> = self
+            .al_senders
+            .iter_mut()
+            .filter_map(|(ssi, (tx, _, _))| {
+                let pdus = tx.tick();
+                (!pdus.is_empty()).then_some((*ssi, pdus))
+            })
+            .collect();
+        for (ssi, pdus) in due {
+            self.queue_al_pdus(TetraAddress { ssi, ssi_type: SsiType::Issi }, pdus);
+        }
+    }
+
+    fn expire_idle_advanced_links(&mut self) {
+        let now = self.dltime;
+        self.advanced_links.retain(|ssi, (_, last_heard)| {
+            let keep = now.diff(*last_heard) < ADVANCED_LINK_IDLE_TIMESLOTS;
+            if !keep {
+                tracing::info!("advanced link for ISSI {} idle, dropped", ssi);
+            }
+            keep
+        });
+        let links = &self.advanced_links;
+        self.al_senders.retain(|ssi, _| links.contains_key(ssi));
     }
 
     fn rx_tma_unitdata_ind_bl(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
@@ -1063,8 +1305,12 @@ impl TetraEntityTrait for Llc {
         // Take oldest element from scheduled_out_acks, and remove it from the list
         had_activity |= self.submit_ack_replies_to_umac(queue);
 
+        self.tick_al_senders();
+
         // Step 4 / 4: Send any U-DATA messages
         had_activity |= self.submit_udata_msgs_to_umac(queue);
+
+        self.expire_idle_advanced_links();
 
         had_activity
     }
@@ -1286,6 +1532,81 @@ mod reattach_tests {
         llc.submit_retransmissions_to_umac(&mut q);
         assert!(llc.outbound_messages.is_empty());
         assert_eq!(receipt.get_state(), TxState::Lost);
+    }
+
+    fn uplink_bits(bits: &str) -> SapMsg {
+        SapMsg { sap: Sap::TmaSap, src: TetraEntity::Umac, dest: TetraEntity::Llc,
+            msg: SapMsgInner::TmaUnitdataInd(TmaUnitdataInd {
+                carrier_num: 1521, pdu: Some(BitBuffer::from_bitstr(bits)), main_address: TetraAddress::issi(100),
+                scrambling_code: 0, link_id: 4, endpoint_id: 0, new_endpoint_id: None,
+                css_endpoint_id: None, air_interface_encryption: 0,
+                chan_change_response_req: false, chan_change_handle: None, chan_info: None,
+            }) }
+    }
+
+    #[test]
+    fn advanced_link_setup_then_sdu_reaches_mle() {
+        let mut llc = station();
+        let mut q = MessageQueue::new();
+        // AL-SETUP captured from an MXP600.
+        llc.rx_tma_unitdata_ind(&mut q, uplink_bits("10001001101011111110000011001"));
+        assert!(q.pop_front().is_none());
+        llc.submit_udata_msgs_to_umac(&mut q);
+        let SapMsgInner::TmaUnitdataReq(req) = q.pop_front().unwrap().msg else { panic!("AL-SETUP reply") };
+        // It asks for 4 uplink slots per frame; offered single-slot with report "service change".
+        assert_eq!(req.pdu.dump_bin_unformatted(), "100010011000111110000011010");
+        assert_eq!(req.link_id, 0);
+
+        // The radio confirms with report "success", which needs no answer.
+        llc.rx_tma_unitdata_ind(&mut q, uplink_bits("100010011000111110000011000"));
+        llc.submit_udata_msgs_to_umac(&mut q);
+        assert!(q.pop_front().is_none());
+        assert_eq!(llc.advanced_links.len(), 1);
+
+        // One SNDCP TL-SDU in a single AL-FINAL-AR: TL-SDU + FCS.
+        let sdu = "1000101000010001";
+        let mut b = BitBuffer::from_bitstr(&format!("{sdu}{}", "0".repeat(32)));
+        let crc = fcs::compute_fcs(&b, 0, sdu.len());
+        b.seek(sdu.len());
+        b.write_bits(crc as u64, 32);
+        b.seek(0);
+        let seg = format!("1001 1 1 000 00000000 {}", b.dump_bin_unformatted()).replace(' ', "");
+        llc.rx_tma_unitdata_ind(&mut q, uplink_bits(&seg));
+        let SapMsgInner::TlaTlDataIndBl(ind) = q.pop_front().unwrap().msg else { panic!("TL-DATA indication") };
+        assert_eq!(ind.tl_sdu.unwrap().dump_bin_unformatted(), sdu);
+        assert!(advanced_link::is_advanced_link_id(ind.link_id));
+        llc.submit_udata_msgs_to_umac(&mut q);
+        let SapMsgInner::TmaUnitdataReq(req) = q.pop_front().unwrap().msg else { panic!("AL-ACK") };
+        assert_eq!(req.pdu.dump_bin_unformatted(), "10111000000000");
+
+        // The answer, sent with the link identifier of the indication, goes back over the link.
+        let mut reply = downlink(Some(false));
+        let SapMsgInner::TlaTlDataReqBl(req) = &mut reply.msg else { unreachable!() };
+        req.link_id = ind.link_id;
+        llc.rx_tla_tldata_req_bl(&mut q, reply);
+        llc.submit_udata_msgs_to_umac(&mut q);
+        let SapMsgInner::TmaUnitdataReq(req) = q.pop_front().unwrap().msg else { panic!("AL-FINAL-AR") };
+        let pdu = req.pdu.dump_bin_unformatted();
+        assert_eq!(&pdu[..17], "10011100000000000", "AL-FINAL-AR, N(S) 0, S(S) 0");
+        assert_eq!(&pdu[17..25], "00100000");
+        assert!(llc.outbound_messages.is_empty(), "nothing on the basic link");
+
+        // The radio's AL-ACK frees the sender.
+        llc.rx_tma_unitdata_ind(&mut q, uplink_bits("10111000000000"));
+        assert!(llc.al_senders[&100].0.is_idle());
+    }
+
+    #[test]
+    fn advanced_link_close_is_confirmed() {
+        let mut llc = station();
+        let mut q = MessageQueue::new();
+        llc.rx_tma_unitdata_ind(&mut q, uplink_bits("10001001101011111110000011001"));
+        llc.rx_tma_unitdata_ind(&mut q, uplink_bits("1111100001"));
+        assert!(llc.advanced_links.is_empty());
+        llc.submit_udata_msgs_to_umac(&mut q);
+        q.pop_front();
+        let SapMsgInner::TmaUnitdataReq(req) = q.pop_front().unwrap().msg else { panic!("AL-DISC reply") };
+        assert_eq!(req.pdu.dump_bin_unformatted(), "1111100000");
     }
 
     #[test]
