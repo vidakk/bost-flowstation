@@ -132,19 +132,18 @@ impl CcBsSubentity {
         let usage = circuit_called.usage;
         let call_timeout = CallTimeout::try_from(call.timeout as u64).unwrap_or(CallTimeout::T5m);
         let circuit_mode = CircuitModeType::try_from(call.mode as u64).unwrap_or(CircuitModeType::TchS);
-        let external_subscriber_number = Self::encode_external_subscriber_number(&call.number);
-        let calling_party_extension = call.number.trim().parse::<u32>().ok().filter(|value| *value <= 0x00ff_ffff);
-
-        // Asterisk SIP callers often have no real TETRA ISSI; derive a display SSI from the
-        // dialled external number so the local MS sees a sensible calling party. Brew keeps its
-        // original behaviour (always uses source_issi, even when 0).
-        let calling_party_address_ssi = if call.source_issi != 0 {
-            Some(call.source_issi)
-        } else if network_entity == TetraEntity::Asterisk {
-            Self::external_number_as_ssi(&call.number)
-        } else {
-            Some(call.source_issi)
-        };
+        // A short numeric SIP caller is carried only as the SSI. Repeating it in the
+        // extension element makes the handset print both addresses stuck together.
+        let (calling_party_address_ssi, calling_party_extension, external_subscriber_number) =
+            if network_entity == TetraEntity::Asterisk && call.source_issi == 0 {
+                Self::asterisk_caller_identity(&call.number)
+            } else {
+                (
+                    Some(call.source_issi),
+                    call.number.trim().parse::<u32>().ok().filter(|value| *value <= 0x00ff_ffff),
+                    Self::encode_external_subscriber_number(&call.number),
+                )
+            };
 
         tracing::info!(
             "CMCE: accepting {:?} setup request uuid={} call_id={} src={} dst={} ts={} duplex={} number='{}'",

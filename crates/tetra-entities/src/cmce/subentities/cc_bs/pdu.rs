@@ -911,6 +911,19 @@ impl CcBsSubentity {
         (value != 0 && value <= 0x00ff_ffff).then_some(value)
     }
 
+    /// Calling-party fields for an Asterisk caller that has no TETRA ISSI.
+    ///
+    /// A numeric extension that fits in an SSI is sent only as that SSI. The
+    /// extension element is a second 24-bit address, and a handset prints the two
+    /// with no separator, so 620 is shown as 000062000000620.
+    pub(super) fn asterisk_caller_identity(number: &str) -> (Option<u32>, Option<u32>, Option<Type3FieldGeneric>) {
+        if let Some(ssi) = Self::external_number_as_ssi(number) {
+            return (Some(ssi), None, None);
+        }
+        let extension = number.trim().parse::<u32>().ok().filter(|value| *value <= 0x00ff_ffff);
+        (None, extension, Self::encode_external_subscriber_number(number))
+    }
+
     /// Decide whether a dialed (non-ISSI) number should be routed to the Asterisk SIP/RTP
     /// bridge instead of Brew. Returns the SIP number to dial (prefix-stripped when configured),
     /// or `None` to leave the call for Brew. Mirrors the upstream fork's `asterisk_route_number`.
@@ -921,15 +934,14 @@ impl CcBsSubentity {
             return None;
         }
 
-        let raw = if !network_call.number.trim().is_empty() {
-            network_call.number.trim().to_string()
-        } else if network_call.destination != 0 {
-            network_call.destination.to_string()
-        } else {
+        // Private calls address an ISSI and carry no external number. Those stay
+        // on the radio path. Phone and PABX calls carry the dialed digits.
+        let raw = network_call.number.trim();
+        if raw.is_empty() {
             return None;
-        };
+        }
 
-        let mut routed = raw.as_str();
+        let mut routed = raw;
         if !cfg.outbound_prefix.is_empty() && raw.starts_with(&cfg.outbound_prefix) && cfg.strip_outbound_prefix {
             routed = &raw[cfg.outbound_prefix.len()..];
         }
@@ -939,18 +951,24 @@ impl CcBsSubentity {
             return None;
         }
 
-        if cfg.service_numbers.is_empty() {
-            if !cfg.outbound_prefix.is_empty() && raw.starts_with(&cfg.outbound_prefix) {
-                return Some(routed.to_string());
-            }
+        let accepted = if cfg.service_numbers.is_empty() {
+            true
+        } else {
+            cfg.service_numbers.iter().any(|n| n == routed)
+        };
+        if !accepted {
             return None;
         }
 
-        if cfg.service_numbers.iter().any(|n| n == routed) {
-            Some(routed.to_string())
-        } else {
-            None
+        // 16777184 is the E.164 phone gateway and 16777185 is the ISDN gateway.
+        // 16777186 is the PABX gateway and is left as a plain extension.
+        // The P marks a public call so a short number is not captured by a local extension.
+        const PREDEF_E164_SSI: u32 = 16_777_184;
+        const PREDEF_ISDN_SSI: u32 = 16_777_185;
+        if network_call.destination == PREDEF_E164_SSI || network_call.destination == PREDEF_ISDN_SSI {
+            return Some(format!("P{routed}"));
         }
+        Some(routed.to_string())
     }
 
     pub(super) fn signal_umac_circuit_open(
@@ -1531,6 +1549,24 @@ impl PreemptVictim {
 #[cfg(test)]
 mod tests {
     use super::CcBsSubentity;
+
+    #[test]
+    fn asterisk_caller_identity_sends_a_short_extension_only_as_ssi() {
+        let (ssi, extension, external) = CcBsSubentity::asterisk_caller_identity("620");
+        assert_eq!(ssi, Some(620));
+        assert_eq!(extension, None);
+        assert!(external.is_none());
+    }
+
+    #[test]
+    fn asterisk_caller_identity_keeps_a_long_cli_as_an_external_number() {
+        let (ssi, extension, external) = CcBsSubentity::asterisk_caller_identity("0114090611");
+        assert_eq!(ssi, None);
+        assert_eq!(extension, None);
+        let external = external.expect("long cli stays an external number");
+        assert_eq!(CcBsSubentity::decode_external_subscriber_number(&external), "0114090611");
+    }
+
     #[cfg(feature = "asterisk")]
     use tetra_config::bluestation::{SharedConfig, parsing};
     #[cfg(feature = "asterisk")]
@@ -1624,8 +1660,9 @@ codec = "PCMU"
     fn asterisk_route_strips_prefix_for_configured_service_numbers() {
         let cc = asterisk_test_cc();
 
-        assert_eq!(cc.asterisk_route_number(&network_call(91600, "")), Some("600".to_string()));
-        assert_eq!(cc.asterisk_route_number(&network_call(91601, "")), Some("601".to_string()));
+        assert_eq!(cc.asterisk_route_number(&network_call(0, "91600")), Some("600".to_string()));
+        assert_eq!(cc.asterisk_route_number(&network_call(0, "91601")), Some("601".to_string()));
+        assert_eq!(cc.asterisk_route_number(&network_call(91600, "")), None);
     }
 
     #[cfg(feature = "asterisk")]
@@ -1643,8 +1680,13 @@ codec = "PCMU"
     fn asterisk_route_accepts_prefixed_numbers_when_service_list_is_empty() {
         let cc = asterisk_open_prefix_test_cc();
 
-        assert_eq!(cc.asterisk_route_number(&network_call(91601, "")), Some("601".to_string()));
+        assert_eq!(cc.asterisk_route_number(&network_call(91601, "")), None);
         assert_eq!(cc.asterisk_route_number(&network_call(0, "91601")), Some("601".to_string()));
+        assert_eq!(cc.asterisk_route_number(&network_call(0, "620")), Some("620".to_string()));
+        assert_eq!(cc.asterisk_route_number(&network_call(0, "0641234567")), Some("0641234567".to_string()));
+        assert_eq!(cc.asterisk_route_number(&network_call(16_777_186, "620")), Some("620".to_string()));
+        assert_eq!(cc.asterisk_route_number(&network_call(16_777_184, "620")), Some("P620".to_string()));
+        assert_eq!(cc.asterisk_route_number(&network_call(16_777_184, "0641234567")), Some("P0641234567".to_string()));
         assert_eq!(cc.asterisk_route_number(&network_call(601, "")), None);
     }
 
