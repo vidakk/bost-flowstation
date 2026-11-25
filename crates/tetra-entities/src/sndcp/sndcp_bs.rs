@@ -1,4 +1,5 @@
 use super::{ip, wap_ip, wap_status};
+use crate::llc::components::advanced_link::is_advanced_link_id;
 use crate::{MessageQueue, TetraEntityTrait};
 use tetra_config::bluestation::SharedConfig;
 use tetra_core::tetra_entities::TetraEntity;
@@ -225,8 +226,8 @@ impl Sndcp {
     }
 
     /// Handle an uplink SN-UNITDATA (type 4) or SN-DATA (type 1/5) carrying an IPv4/UDP N-PDU: parse
-    /// it, classify the WAP request, render the response, and send it back as a downlink SN-UNITDATA
-    /// (always type 4). `pdu` is the SN-PDU bit-string (after the 3-bit MLE discriminator).
+    /// it, classify the WAP request, render the response, and send it back. `pdu` is the SN-PDU
+    /// bit-string (after the 3-bit MLE discriminator).
     fn handle_wap_data(&self, queue: &mut MessageQueue, ind: &LtpdMleUnitdataInd, pdu: &str) {
         if !self.wap_enabled() {
             tracing::debug!("SNDCP: WAP-IP profile disabled; dropping SN-DATA/UNITDATA");
@@ -257,7 +258,10 @@ impl Sndcp {
             nsapi,
             datagram.len(),
         );
-        let sdu = build_downlink_unitdata_sdu(nsapi, &datagram);
+        // A request that came as SN-DATA over the MS's advanced link is answered the same way
+        // (clause 28.3.3a); the LLC sends it back over that link.
+        let sn_type = if is_advanced_link_id(ind.link_id) { u64::from(SN_PDU_DATA) } else { SN_PDU_UNITDATA };
+        let sdu = build_downlink_sdu(sn_type, nsapi, &datagram);
         self.send_sndcp_downlink(queue, ind, sdu, None);
     }
 
@@ -346,13 +350,13 @@ fn npdu_bits_to_bytes(bits: &str) -> Option<Vec<u8>> {
     (0..bits.len()).step_by(8).map(|i| u8::from_str_radix(&bits[i..i + 8], 2).ok()).collect()
 }
 
-/// Encapsulate a downlink IPv4/UDP datagram in an SN-UNITDATA PDU (always type 4, even for an
-/// SN-DATA request), prefixed with the 3-bit MLE SNDCP discriminator. Header: type(4) NSAPI(4)
+/// Encapsulate a downlink IPv4/UDP datagram in an SN-UNITDATA or SN-DATA PDU (`sn_type`; both
+/// share this layout), prefixed with the 3-bit MLE SNDCP discriminator. Header: type(4) NSAPI(4)
 /// PCOMP(4)=0 DCOMP(4)=0, then the datagram copied bit-for-bit (spec §5.1).
-fn build_downlink_unitdata_sdu(nsapi: u64, datagram: &[u8]) -> BitBuffer {
+fn build_downlink_sdu(sn_type: u64, nsapi: u64, datagram: &[u8]) -> BitBuffer {
     let mut sdu = BitBuffer::new_autoexpand(3 + datagram.len());
     sdu.write_bits(MLE_DISCRIMINATOR_SNDCP, 3);
-    sdu.write_bits(SN_PDU_UNITDATA, 4);
+    sdu.write_bits(sn_type, 4);
     sdu.write_bits(nsapi, 4);
     sdu.write_bits(0, 4); // PCOMP = 0
     sdu.write_bits(0, 4); // DCOMP = 0
@@ -666,7 +670,7 @@ mod tests {
 
     #[test]
     fn downlink_unitdata_sdu_frames_type4_with_discriminator() {
-        let sdu = build_downlink_unitdata_sdu(2, &[0x45, 0x00]);
+        let sdu = build_downlink_sdu(SN_PDU_UNITDATA, 2, &[0x45, 0x00]);
         let bits = sdu.dump_bin_unformatted();
         assert!(bits.starts_with("100"), "3-bit MLE SNDCP discriminator"); // 0b100
         assert_eq!(&bits[3..7], "0100", "SN-PDU type = 4 (UNITDATA)");
