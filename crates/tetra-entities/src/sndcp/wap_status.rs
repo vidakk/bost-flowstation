@@ -63,6 +63,8 @@ pub struct WapStatusSnapshot {
     pub uptime_secs: u64,
     pub last_activity: String,
     pub health: String,
+    /// Link the browser index to the web proxy's start page.
+    pub web_link: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -415,11 +417,20 @@ fn sector_labels(snap: &WapStatusSnapshot) -> Vec<(&'static str, String)> {
 fn browser_xhtml_index(snap: &WapStatusSnapshot, _cap: usize) -> String {
     let title = escape_xhtml_text_limited(&snap.title, CAP_BROWSER_INLINE);
     let mut p = String::new();
-    p.push_str("<html><body>Welcome to ");
-    p.push_str(&title);
-    p.push('!');
-    p.push_str(BROWSER_BR);
-    p.push_str("<a href=\"/status.wml?s=1\">Status</a>");
+    p.push_str("<html><body>");
+    if snap.web_link {
+        // The Openwave index budget is 104 bytes, which cannot hold the welcome line plus a
+        // second link. The title alone leaves room for both.
+        p.push_str(&title);
+        p.push_str(BROWSER_BR);
+        p.push_str("<a href=\"/status.wml?s=1\">Status</a> <a href=\"/web\">Web</a>");
+    } else {
+        p.push_str("Welcome to ");
+        p.push_str(&title);
+        p.push('!');
+        p.push_str(BROWSER_BR);
+        p.push_str("<a href=\"/status.wml?s=1\">Status</a>");
+    }
     p.push_str("</body></html>");
     p
 }
@@ -483,6 +494,7 @@ mod tests {
             uptime_secs: 93_784,
             last_activity: "SDS 2260082>2260618".to_string(),
             health: "OK".to_string(),
+            web_link: false,
         }
     }
 
@@ -609,6 +621,15 @@ mod tests {
         assert!(body.len() <= WSP_OPENWAVE_XHTML_INDEX_MAX, "index clamped to 104");
         let s = String::from_utf8(body).unwrap();
         assert!(s.contains("Welcome to Nexus-BS!"));
+        assert!(s.contains("href=\"/status.wml?s=1\""));
+
+        let mut web = sample();
+        web.web_link = true;
+        web.title = "FlowStation".into();
+        let (_ct, body) = serve_wsp_path("/", &web, 541);
+        assert!(body.len() <= WSP_OPENWAVE_XHTML_INDEX_MAX, "index with the web link is {} bytes", body.len());
+        let s = String::from_utf8(body).unwrap();
+        assert!(s.contains("href=\"/web\""));
         assert!(s.contains("href=\"/status.wml?s=1\""));
     }
 

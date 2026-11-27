@@ -70,6 +70,101 @@ pub struct WapIpDto {
     pub max_request_payload_bytes: Option<usize>,
 }
 
+/// Which sites the WAP web proxy may fetch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WapProxyMode {
+    /// Any public internet host; private, loopback and link-local addresses stay unreachable.
+    Open,
+    /// Only the hosts in `allowlist` (and their subdomains).
+    Allowlist,
+}
+
+/// Compiled WAP web proxy configuration (present when `[cell_info.wap_proxy]` exists). The
+/// proxy fetches HTTP(S) pages for WAP browsers and converts them to small WML pages.
+#[derive(Debug, Clone)]
+pub struct CfgWapProxy {
+    pub enabled: bool,
+    pub mode: WapProxyMode,
+    /// Lower-case host names. In allowlist mode the only reachable hosts; in open mode hosts
+    /// that may also resolve to private addresses or use a non-default port.
+    pub allowlist: Vec<String>,
+    /// Radios allowed to use the proxy. Empty = every radio, accepted only in allowlist mode.
+    pub issis: Vec<u32>,
+    pub timeout_secs: u64,
+    pub max_fetch_bytes: usize,
+    /// Upstream fetches allowed per radio per minute; paging through a fetched page is free.
+    pub fetches_per_minute: u32,
+    /// How long a fetched page stays available for paging, in seconds.
+    pub cache_secs: u64,
+    /// Body budget for one WML page sent to the radio, in bytes.
+    pub page_bytes: usize,
+}
+
+impl CfgWapProxy {
+    pub fn radio_allowed(&self, issi: u32) -> bool {
+        self.issis.is_empty() || self.issis.contains(&issi)
+    }
+
+    /// True when `host` is an allowlist entry or a subdomain of one.
+    pub fn host_allowlisted(&self, host: &str) -> bool {
+        let host = host.trim_end_matches('.').to_ascii_lowercase();
+        self.allowlist
+            .iter()
+            .any(|e| host == *e || host.strip_suffix(e.as_str()).is_some_and(|p| p.ends_with('.')))
+    }
+
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.mode == WapProxyMode::Open && self.issis.is_empty() {
+            return Err("cell_info.wap_proxy: mode = \"open\" needs a non-empty issis list");
+        }
+        if self.mode == WapProxyMode::Allowlist && self.allowlist.is_empty() {
+            return Err("cell_info.wap_proxy: mode = \"allowlist\" needs a non-empty allowlist");
+        }
+        Ok(())
+    }
+}
+
+/// Serde DTO for `[cell_info.wap_proxy]`.
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WapProxyDto {
+    pub enabled: Option<bool>,
+    pub mode: Option<WapProxyMode>,
+    pub allowlist: Option<Vec<String>>,
+    pub issis: Option<Vec<u32>>,
+    pub timeout_secs: Option<u64>,
+    pub max_fetch_bytes: Option<usize>,
+    pub fetches_per_minute: Option<u32>,
+    pub cache_secs: Option<u64>,
+    pub page_bytes: Option<usize>,
+}
+
+impl WapProxyDto {
+    fn compile(self) -> CfgWapProxy {
+        CfgWapProxy {
+            enabled: self.enabled.unwrap_or(false),
+            mode: self.mode.unwrap_or(WapProxyMode::Allowlist),
+            allowlist: self
+                .allowlist
+                .unwrap_or_default()
+                .into_iter()
+                .map(|h| h.trim().trim_end_matches('.').to_ascii_lowercase())
+                .filter(|h| !h.is_empty())
+                .collect(),
+            issis: self.issis.unwrap_or_default(),
+            timeout_secs: self.timeout_secs.unwrap_or(8).clamp(1, 30),
+            max_fetch_bytes: self.max_fetch_bytes.unwrap_or(200_000).clamp(4_096, 2_000_000),
+            fetches_per_minute: self.fetches_per_minute.unwrap_or(10).clamp(1, 120),
+            cache_secs: self.cache_secs.unwrap_or(300).clamp(30, 3_600),
+            page_bytes: self.page_bytes.unwrap_or(480).clamp(120, 520),
+        }
+    }
+}
+
 /// Parse a dotted-quad IPv4 string (e.g. "10.0.0.1") into four octets.
 fn parse_ipv4_octets(s: Option<&str>) -> Option<[u8; 4]> {
     let parts: Vec<&str> = s?.split('.').collect();
@@ -332,6 +427,9 @@ pub struct CfgCellInfo {
     /// sub-section together with its `enabled` flag; must agree with `sndcp_service`.
     pub wap_ip: Option<CfgWapIp>,
 
+    /// WAP web proxy, configured via `[cell_info.wap_proxy]`. Only used while the WAP gateway runs.
+    pub wap_proxy: Option<CfgWapProxy>,
+
     /// Neighbor cells to include in D-NWRK-BROADCAST for cell reselection.
     /// Up to 7 entries. MSs use this list to find alternative cells when signal degrades.
     pub neighbor_cells_ca: Vec<CfgNeighborCellCa>,
@@ -482,6 +580,9 @@ pub struct CellInfoDto {
     /// WAP-IP packet-data gateway. Enabled by presence of this sub-section plus its `enabled` flag.
     pub wap_ip: Option<WapIpDto>,
 
+    /// WAP web proxy. Enabled by presence of this sub-section plus its `enabled` flag.
+    pub wap_proxy: Option<WapProxyDto>,
+
     /// Neighbor cells for D-NWRK-BROADCAST. Up to 7 entries.
     /// Parsed separately in parsing.rs from toml::Value to avoid serde flatten conflict.
     #[serde(skip)]
@@ -601,6 +702,7 @@ pub fn cell_dto_to_cfg(ci: CellInfoDto) -> CfgCellInfo {
             response_ttl: w.response_ttl.filter(|&t| t != 0).unwrap_or(32),
             max_request_payload_bytes: w.max_request_payload_bytes.unwrap_or(1024).clamp(1, 1024),
         }),
+        wap_proxy: ci.wap_proxy.map(WapProxyDto::compile),
         neighbor_cells_ca: ci.neighbor_cells_ca,
         hangtime_secs: ci.hangtime_secs.unwrap_or(5).clamp(0, 300),
         call_timeout_secs: {

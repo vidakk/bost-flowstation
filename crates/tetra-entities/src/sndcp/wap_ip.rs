@@ -249,6 +249,15 @@ pub fn wtp_result(req_tid: u16, wsp: &[u8]) -> Vec<u8> {
     out
 }
 
+/// WTP Ack from the responder for `req_tid`: `[0x18, respTID_be16]`. Sent before a slow Result
+/// so the initiator stops retransmitting its Invoke and waits (hold-on acknowledgement).
+pub fn wtp_ack(req_tid: u16) -> Vec<u8> {
+    let resp_tid = (req_tid & WTP_TID_VALUE_MASK) | WTP_TID_RESPONSE_FLAG;
+    let mut out = vec![WTP_PDU_ACK << 3];
+    out.extend_from_slice(&resp_tid.to_be_bytes());
+    out
+}
+
 /// Encode one Connect-Reply capability: `[uintvar(1+len(val)), id, uintvar(val)]`.
 fn connect_reply_cap(id: u8, value: u32) -> Vec<u8> {
     let val = encode_uintvar(value);
@@ -277,6 +286,16 @@ pub fn wsp_connect_reply(client_sdu: u32, server_sdu: u32) -> Vec<u8> {
 pub fn wsp_reply(content_type: u8, body: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(4 + body.len());
     out.extend_from_slice(&[WSP_PDU_REPLY, WSP_STATUS_OK, 0x01, content_type]);
+    out.extend_from_slice(body);
+    out
+}
+
+/// A [`wsp_reply`] that also carries `Cache-Control: no-cache`, so a radio refetches the page
+/// instead of showing the copy it saved. Header layout: content-type, then field 0x08
+/// (Cache-Control) with value octet 128 (no-cache). WAP-230 tables 39 and 38.
+pub fn wsp_reply_nocache(content_type: u8, body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(6 + body.len());
+    out.extend_from_slice(&[WSP_PDU_REPLY, WSP_STATUS_OK, 0x03, content_type, 0x88, 0x80]);
     out.extend_from_slice(body);
     out
 }
@@ -388,12 +407,20 @@ mod tests {
         let out = wtp_result(0x1234, &wsp);
         assert_eq!(&out[..7], &hex("12 92 34 04 20 01 c5")[..]);
         assert_eq!(&out[7..], b"<html/>");
+        let fresh = wtp_result(0x1234, &wsp_reply_nocache(WSP_CT_XHTML, b"<html/>"));
+        assert_eq!(&fresh[..9], &hex("12 92 34 04 20 03 c5 88 80")[..]);
     }
 
     // §7.4 WSP Resume (TID 0x13f5) -> [0x12, 0x93, 0xf5, 0x04, 0x20, 0x00].
     #[test]
     fn resume_ok_vector() {
         assert_eq!(wtp_result(0x13f5, &wsp_resume_ok()), hex("12 93 f5 04 20 00"));
+    }
+
+    #[test]
+    fn hold_on_ack_is_a_responder_ack() {
+        assert_eq!(wtp_ack(0x13cc), hex("18 93 cc"));
+        assert_eq!(classify(&wtp_ack(0x13cc)), WapRequest::WtpControlNoResponse { pdu: 3 });
     }
 
     // §7.4 control PDUs -> no datagram.

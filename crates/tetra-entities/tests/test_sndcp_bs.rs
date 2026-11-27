@@ -1,10 +1,14 @@
 mod common;
 
 use common::ComponentTest;
-use tetra_config::bluestation::{CfgWapIp, StackMode};
+use tetra_config::bluestation::{CfgWapIp, CfgWapProxy, StackMode, WapProxyMode};
 use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::{BitBuffer, Sap, SsiType, TdmaTime, TetraAddress, debug};
-use tetra_entities::sndcp::ip;
+use tetra_entities::llc::components::advanced_link::ADVANCED_LINK_ID_BASE;
+use tetra_entities::sndcp::sndcp_bs::Sndcp;
+use tetra_entities::sndcp::wap_proxy::{FetchError, Fetched, Fetcher};
+use tetra_entities::sndcp::{ip, wap_ip};
+use tetra_entities::{MessageQueue, TetraEntityTrait};
 use tetra_pdus::umac::enums::access_assign_dl_usage::AccessAssignDlUsage;
 use tetra_pdus::umac::enums::access_assign_ul_usage::AccessAssignUlUsage;
 use tetra_pdus::umac::pdus::access_assign::AccessAssign;
@@ -22,6 +26,7 @@ const PDCH_TS: u8 = 4;
 /// MLE protocol discriminator for SNDCP.
 const MLE_PD_SNDCP: u64 = 0b100;
 const SN_UNITDATA: u64 = 4;
+const SN_DATA: u64 = 5;
 const SN_DATA_TRANSMIT_REQUEST: u64 = 6;
 const SN_RECONNECT: u64 = 9;
 
@@ -248,4 +253,92 @@ fn wap_response_reaches_the_ms_on_its_packet_data_channel() {
         without_alloc.iter().all(|&t| t == PDCH_TS),
         "the WAP response goes out on the packet data channel, got ts {without_alloc:?}"
     );
+}
+
+/// Serves one small HTML page for any URL.
+struct OnePageFetcher;
+
+impl Fetcher for OnePageFetcher {
+    fn fetch(&self, url: &reqwest::Url) -> Result<Fetched, FetchError> {
+        Ok(Fetched {
+            url: url.clone(),
+            status: 200,
+            content_type: "text/html".into(),
+            body: b"<html><head><title>Hi</title></head><body><p>Hello radio</p></body></html>".to_vec(),
+            truncated: false,
+        })
+    }
+}
+
+/// SN-DATA over the advanced link carrying a WTP Invoke + WSP GET of `uri`.
+fn uplink_wsp_get(link_id: u32, tid: u16, uri: &str) -> SapMsg {
+    let mut wtp = vec![0x08, (tid >> 8) as u8, tid as u8, 0x12, 0x40];
+    wtp.extend_from_slice(&wap_ip::encode_uintvar(uri.len() as u32));
+    wtp.extend_from_slice(uri.as_bytes());
+    let npdu = ip::build_ipv4_udp([10, 0, 0, 226], [10, 0, 0, 1], 49152, 9200, 7, 32, &wtp);
+    uplink(link_id, |sdu| {
+        sdu.write_bits(SN_DATA, 4);
+        sdu.write_bits(1, 4); // NSAPI
+        sdu.write_bits(0, 8); // PCOMP, DCOMP
+        for byte in npdu {
+            sdu.write_bits(u64::from(byte), 8);
+        }
+    })
+}
+
+/// The SN-PDU type, link and UDP payload of a downlink WAP reply.
+fn downlink_wap_reply(msg: SapMsg) -> (u8, u32, Vec<u8>) {
+    let SapMsgInner::TlaTlDataReqBl(req) = msg.msg else { panic!("expected TL-DATA, got {:?}", msg.msg) };
+    let bits = req.tl_sdu.dump_bin_unformatted();
+    let sn_type = u8::from_str_radix(&bits[3..7], 2).unwrap();
+    let bytes: Vec<u8> = (19..bits.len()).step_by(8).map(|i| u8::from_str_radix(&bits[i..i + 8], 2).unwrap()).collect();
+    let ipv4 = ip::parse_ipv4(&bytes).unwrap();
+    assert_eq!((ipv4.src, ipv4.dst), ([10, 0, 0, 1], [10, 0, 0, 226]));
+    let udp = ip::parse_udp(ipv4.payload).unwrap();
+    (sn_type, req.link_id, udp.payload.to_vec())
+}
+
+/// A GET for an internet page gets a WTP hold-on Ack at once, and the converted page follows once
+/// the fetch is done, both over the advanced link the request came on.
+#[test]
+fn proxied_page_is_held_then_sent_over_the_advanced_link() {
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.wap_ip = Some(CfgWapIp { enabled: true, address: [10, 0, 0, 1], port: 9200, response_ttl: 32, max_request_payload_bytes: 1024 });
+    config.cell.wap_proxy = Some(CfgWapProxy {
+        enabled: true,
+        mode: WapProxyMode::Open,
+        allowlist: vec![],
+        issis: vec![ms_address().ssi],
+        timeout_secs: 8,
+        max_fetch_bytes: 200_000,
+        fetches_per_minute: 10,
+        cache_secs: 300,
+        page_bytes: 480,
+    });
+    let shared = ComponentTest::from_config(config, Some(TdmaTime { h: 0, m: 1, f: 1, t: 1 })).config;
+    let mut sndcp = Sndcp::with_fetcher(shared, Box::new(OnePageFetcher));
+    let mut queue = MessageQueue::new();
+    let al_link = ADVANCED_LINK_ID_BASE + 1;
+
+    sndcp.rx_prim(&mut queue, uplink_wsp_get(al_link, 0x21, "http://example.com/"));
+    let (sn_type, link, payload) = downlink_wap_reply(queue.pop_front().expect("hold-on Ack"));
+    assert_eq!((sn_type, link), (SN_DATA as u8, al_link));
+    assert_eq!(payload, wap_ip::wtp_ack(0x21));
+    assert!(queue.pop_front().is_none());
+
+    let ts = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut reply = None;
+    for _ in 0..300 {
+        sndcp.tick_end(&mut queue, ts);
+        if let Some(m) = queue.pop_front() {
+            reply = Some(m);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let (sn_type, link, payload) = downlink_wap_reply(reply.expect("the page follows"));
+    assert_eq!((sn_type, link), (SN_DATA as u8, al_link));
+    assert_eq!(&payload[..3], &wap_ip::wtp_result(0x21, &[])[..], "WTP Result for the same transaction");
+    let body = String::from_utf8_lossy(&payload[7..]);
+    assert_eq!(body, "<wml><card title=\"Hi\"><p>Hello radio</p></card></wml>");
 }

@@ -857,6 +857,29 @@ main_carrier_number = 1586
     }
 
     #[test]
+    fn wap_proxy_parses_and_open_mode_needs_radios() {
+        use crate::bluestation::WapProxyMode;
+        let cfg = from_toml_str(&minimal_toml(
+            "[cell_info.wap_proxy]\nenabled = true\nmode = \"open\"\nallowlist = [\"Lite.DuckDuckGo.com.\"]\nissis = [2200279, 2200794]",
+        ))
+        .expect("parse");
+        let p = cfg.cell.wap_proxy.clone().expect("wap_proxy resolved");
+        assert_eq!(p.mode, WapProxyMode::Open);
+        assert_eq!(p.allowlist, vec!["lite.duckduckgo.com".to_string()]);
+        assert!(p.radio_allowed(2200279) && !p.radio_allowed(1234));
+        assert!(p.host_allowlisted("lite.duckduckgo.com") && p.host_allowlisted("a.lite.duckduckgo.com"));
+        assert!(!p.host_allowlisted("xlite.duckduckgo.com") && !p.host_allowlisted("duckduckgo.com"));
+        assert_eq!((p.timeout_secs, p.max_fetch_bytes, p.page_bytes), (8, 200_000, 480));
+        assert!(cfg.validate().is_ok());
+
+        let validated = |extra: &str| from_toml_str(&minimal_toml(extra)).expect("parses").validate();
+        assert!(validated("[cell_info.wap_proxy]\nenabled = true\nmode = \"open\"").is_err(), "open needs issis");
+        assert!(validated("[cell_info.wap_proxy]\nenabled = true").is_err(), "allowlist mode needs hosts");
+        assert!(validated("[cell_info.wap_proxy]\nenabled = false\nmode = \"open\"").is_ok(), "off is never fatal");
+        assert!(from_toml_str(&minimal_toml("[cell_info.wap_proxy]\nenabled = true\nbogus = 1")).is_err());
+    }
+
+    #[test]
     fn wap_master_switch_never_fails_to_start() {
         let validated = |extra: &str| from_toml_str(&minimal_toml(extra)).expect("parses").validate();
 

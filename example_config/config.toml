@@ -410,6 +410,22 @@ voice_service = true
 # port                      = 9200        # UDP port the WAP request is sent to (default: 9200)
 # response_ttl              = 32          # IPv4 TTL on the downlink reply (default: 32)
 # max_request_payload_bytes = 1024        # cap on an inbound request, bytes (1–1024; default: 1024)
+#
+# Web proxy: WAP browsers can open http(s) sites through the station, converted
+# to small WML pages with Prev/Next links. Private, loopback and link-local
+# addresses are never fetched unless the host is on the allowlist. Radio-to-BS
+# traffic is unencrypted on air, so don't browse anything sensitive.
+#
+# [cell_info.wap_proxy]
+# enabled            = true
+# mode               = "allowlist"                # "allowlist" (default) or "open" (any public host)
+# allowlist          = ["lite.duckduckgo.com"]    # hosts (and subdomains); required in allowlist mode
+# issis              = [1001, 1002]               # radios allowed; required in open mode, empty = all
+# timeout_secs       = 8                          # per fetch (1–30)
+# max_fetch_bytes    = 200000                     # upstream page cap (4096–2000000)
+# fetches_per_minute = 10                         # per radio; paging a fetched page is free
+# cache_secs         = 300                        # how long a fetched page can be paged
+# page_bytes         = 480                        # WML page size sent to the radio (120–520)
 ###############################################################################
 
 ###############################################################################

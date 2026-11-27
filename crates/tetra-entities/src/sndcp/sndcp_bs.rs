@@ -1,9 +1,11 @@
+use super::wap_proxy::{self, GetAction, WapProxy};
 use super::{ip, wap_ip, wap_status};
 use crate::llc::components::advanced_link::is_advanced_link_id;
 use crate::{MessageQueue, TetraEntityTrait};
+use std::time::Instant;
 use tetra_config::bluestation::SharedConfig;
 use tetra_core::tetra_entities::TetraEntity;
-use tetra_core::{BitBuffer, Sap};
+use tetra_core::{BitBuffer, EndpointId, LinkId, Sap, TdmaTime, TetraAddress};
 use tetra_saps::lcmc::enums::alloc_type::ChanAllocType;
 use tetra_saps::lcmc::enums::ul_dl_assignment::UlDlAssignment;
 use tetra_saps::lcmc::fields::chan_alloc_req::CmceChanAllocReq;
@@ -67,14 +69,32 @@ const CHAP_CODE_SUCCESS: u64 = 3; // RFC 1994 CHAP code: 3 = Success
 /// protocol identity(16) + length-of-contents(8) + CHAP Success packet(4 octets = 32) = 60.
 const PCO_CHAP_SUCCESS_BITS: u64 = 60;
 
+/// Where a WAP reply goes: the radio's link and the UDP endpoint its request came from.
+#[derive(Debug, Clone)]
+struct WapReplyTo {
+    address: TetraAddress,
+    link_id: LinkId,
+    endpoint_id: EndpointId,
+    nsapi: u64,
+    sn_type: u64,
+    ms_ip: [u8; 4],
+    ms_port: u16,
+    ip_id: u16,
+}
+
 pub struct Sndcp {
-    #[allow(dead_code)] // wired up when the full packet-data state machine is implemented
     config: SharedConfig,
+    proxy: WapProxy<WapReplyTo>,
 }
 
 impl Sndcp {
     pub fn new(config: SharedConfig) -> Self {
-        Self { config }
+        Self { config, proxy: WapProxy::default() }
+    }
+
+    /// An SNDCP entity whose WAP web proxy fetches with `fetcher` instead of over HTTP.
+    pub fn with_fetcher(config: SharedConfig, fetcher: Box<dyn wap_proxy::Fetcher>) -> Self {
+        Self { config, proxy: WapProxy::with_fetcher(fetcher) }
     }
 
     /// Reply to an SN-ACTIVATE PDP CONTEXT DEMAND with a spec-conformant SN-ACTIVATE PDP CONTEXT
@@ -212,6 +232,7 @@ impl Sndcp {
             uptime_secs: reg.uptime_secs(),
             last_activity,
             health: health.to_string(),
+            web_link: false,
         }
     }
 
@@ -228,7 +249,7 @@ impl Sndcp {
     /// Handle an uplink SN-UNITDATA (type 4) or SN-DATA (type 1/5) carrying an IPv4/UDP N-PDU: parse
     /// it, classify the WAP request, render the response, and send it back. `pdu` is the SN-PDU
     /// bit-string (after the 3-bit MLE discriminator).
-    fn handle_wap_data(&self, queue: &mut MessageQueue, ind: &LtpdMleUnitdataInd, pdu: &str) {
+    fn handle_wap_data(&mut self, queue: &mut MessageQueue, ind: &LtpdMleUnitdataInd, pdu: &str) {
         if !self.wap_enabled() {
             tracing::debug!("SNDCP: WAP-IP profile disabled; dropping SN-DATA/UNITDATA");
             return;
@@ -247,7 +268,41 @@ impl Sndcp {
         };
 
         let endpoint = self.wap_endpoint();
-        let snapshot = self.build_snapshot();
+        // A request that came as SN-DATA over the MS's advanced link is answered the same way
+        // (clause 28.3.3a); the LLC sends it back over that link.
+        let sn_type = if is_advanced_link_id(ind.link_id) { u64::from(SN_PDU_DATA) } else { SN_PDU_UNITDATA };
+
+        if let Some(get) = parse_wsp_get(&endpoint, &npdu) {
+            let to = WapReplyTo {
+                address: ind.received_tetra_address,
+                link_id: ind.link_id,
+                endpoint_id: ind.endpoint_id,
+                nsapi,
+                sn_type,
+                ms_ip: get.ms_ip,
+                ms_port: get.ms_port,
+                ip_id: get.ip_id,
+            };
+            let proxy_cfg = self.config.config().cell.wap_proxy.clone();
+            let action = self.proxy.handle_get(
+                proxy_cfg.as_ref(),
+                endpoint.address,
+                to.address.ssi,
+                get.tid,
+                get.retransmission,
+                &get.path,
+                to.clone(),
+                Instant::now(),
+            );
+            if let GetAction::Reply(payload) = action {
+                self.send_wap_payload(queue, &endpoint, &to, 1, &payload);
+                return;
+            }
+            tracing::info!("SNDCP: WAP local page {:?} for {}", get.path, to.address);
+        }
+
+        let mut snapshot = self.build_snapshot();
+        snapshot.web_link = self.config.config().cell.wap_proxy.as_ref().is_some_and(|p| p.enabled);
         let Some(datagram) = build_wap_response(&endpoint, &npdu, &snapshot) else {
             return; // not UDP, not for the gateway port, a WTP control PDU, or unsupported
         };
@@ -258,11 +313,25 @@ impl Sndcp {
             nsapi,
             datagram.len(),
         );
-        // A request that came as SN-DATA over the MS's advanced link is answered the same way
-        // (clause 28.3.3a); the LLC sends it back over that link.
-        let sn_type = if is_advanced_link_id(ind.link_id) { u64::from(SN_PDU_DATA) } else { SN_PDU_UNITDATA };
         let sdu = build_downlink_sdu(sn_type, nsapi, &datagram);
-        self.send_sndcp_downlink(queue, ind, sdu, None);
+        self.send_sndcp_downlink(queue, ind.received_tetra_address, ind.link_id, ind.endpoint_id, sdu, None);
+    }
+
+    /// Send a WTP PDU from the gateway to the radio's UDP endpoint. `id_step` is added to the
+    /// request's IP id so a hold-on Ack and the later Result carry different ids.
+    fn send_wap_payload(&self, queue: &mut MessageQueue, endpoint: &wap_ip::WapEndpoint, to: &WapReplyTo, id_step: u16, payload: &[u8]) {
+        let datagram = ip::build_ipv4_udp(
+            endpoint.address,
+            to.ms_ip,
+            endpoint.port,
+            to.ms_port,
+            to.ip_id.wrapping_add(id_step),
+            endpoint.response_ttl,
+            payload,
+        );
+        tracing::info!("SNDCP: -> WAP proxy reply to {:?}: NSAPI={} {} datagram bytes", to.address, to.nsapi, datagram.len());
+        let sdu = build_downlink_sdu(to.sn_type, to.nsapi, &datagram);
+        self.send_sndcp_downlink(queue, to.address, to.link_id, to.endpoint_id, sdu, None);
     }
 
     /// Grant (or release) the packet-data channel: send `sdu` (an SN-DATA TRANSMIT RESPONSE for a
@@ -279,20 +348,28 @@ impl Sndcp {
             alloc.alloc_type,
             alloc.ul_dl_assigned,
         );
-        self.send_sndcp_downlink(queue, ind, sdu, Some(alloc));
+        self.send_sndcp_downlink(queue, ind.received_tetra_address, ind.link_id, ind.endpoint_id, sdu, Some(alloc));
     }
 
-    /// Push a downlink SNDCP PDU (3-bit discriminator already prepended) to LLC over the acknowledged
-    /// basic link, optionally carrying a PDCH channel allocation.
-    fn send_sndcp_downlink(&self, queue: &mut MessageQueue, ind: &LtpdMleUnitdataInd, sdu: BitBuffer, chan_alloc: Option<CmceChanAllocReq>) {
+    /// Push a downlink SNDCP PDU (3-bit discriminator already prepended) to LLC on the link the MS
+    /// used, optionally carrying a PDCH channel allocation.
+    fn send_sndcp_downlink(
+        &self,
+        queue: &mut MessageQueue,
+        main_address: TetraAddress,
+        link_id: LinkId,
+        endpoint_id: EndpointId,
+        sdu: BitBuffer,
+        chan_alloc: Option<CmceChanAllocReq>,
+    ) {
         queue.push_back(SapMsg {
             sap: Sap::TlaSap,
             src: TetraEntity::Sndcp,
             dest: TetraEntity::Llc,
             msg: SapMsgInner::TlaTlDataReqBl(TlaTlDataReqBl {
-                main_address: ind.received_tetra_address,
-                link_id: ind.link_id,
-                endpoint_id: ind.endpoint_id,
+                main_address,
+                link_id,
+                endpoint_id,
                 tl_sdu: sdu,
                 stealing_permission: false,
                 subscriber_class: 0,
@@ -329,7 +406,7 @@ fn build_wap_response(endpoint: &wap_ip::WapEndpoint, npdu: &[u8], snapshot: &wa
         }
         wap_ip::WapRequest::WtpWspGet { tid, path, .. } => {
             let (content_type, body) = wap_status::serve_wsp_path(&path, snapshot, WAP_WSP_STATUS_MAX_BYTES);
-            wap_ip::wtp_result(tid, &wap_ip::wsp_reply(content_type, &body))
+            wap_ip::wtp_result(tid, &wap_ip::wsp_reply_nocache(content_type, &body))
         }
         wap_ip::WapRequest::WtpWspResume { tid, .. } => wap_ip::wtp_result(tid, &wap_ip::wsp_resume_ok()),
         wap_ip::WapRequest::TextGet { .. } => {
@@ -339,6 +416,33 @@ fn build_wap_response(endpoint: &wap_ip::WapEndpoint, npdu: &[u8], snapshot: &wa
         wap_ip::WapRequest::WtpControlNoResponse { .. } | wap_ip::WapRequest::Unsupported { .. } => return None,
     };
     Some(wap_ip::build_response_datagram(endpoint, &ipv4, udp.src_port, ipv4.id, &udp_payload))
+}
+
+/// A WSP GET addressed to the gateway, with what is needed to answer it later.
+struct WspGet {
+    ms_ip: [u8; 4],
+    ms_port: u16,
+    ip_id: u16,
+    tid: u16,
+    retransmission: bool,
+    path: String,
+}
+
+fn parse_wsp_get(endpoint: &wap_ip::WapEndpoint, npdu: &[u8]) -> Option<WspGet> {
+    let ipv4 = ip::parse_ipv4(npdu).ok()?;
+    if ipv4.protocol != ip::IPV4_PROTOCOL_UDP {
+        return None;
+    }
+    let udp = ip::parse_udp(ipv4.payload).ok()?;
+    if udp.dst_port != endpoint.port {
+        return None;
+    }
+    match wap_ip::classify(udp.payload) {
+        wap_ip::WapRequest::WtpWspGet { tid, retransmission, path } => {
+            Some(WspGet { ms_ip: ipv4.src, ms_port: udp.src_port, ip_id: ipv4.id, tid, retransmission, path })
+        }
+        _ => None,
+    }
 }
 
 /// Convert a bit-string of an N-PDU to octets. Returns `None` for an empty or non-octet-aligned
@@ -502,6 +606,20 @@ fn find_chap_response_id(demand: &str) -> Option<u8> {
 impl TetraEntityTrait for Sndcp {
     fn entity(&self) -> TetraEntity {
         TetraEntity::Sndcp
+    }
+
+    fn tick_end(&mut self, queue: &mut MessageQueue, _ts: TdmaTime) -> bool {
+        if !self.proxy.has_pending() {
+            return false;
+        }
+        let endpoint = self.wap_endpoint();
+        let proxy_cfg = self.config.config().cell.wap_proxy.clone();
+        let replies = self.proxy.poll(proxy_cfg.as_ref(), endpoint.address, Instant::now());
+        let sent = !replies.is_empty();
+        for (to, payload) in replies {
+            self.send_wap_payload(queue, &endpoint, &to, 2, &payload);
+        }
+        sent
     }
 
     fn rx_prim(&mut self, queue: &mut MessageQueue, message: SapMsg) {

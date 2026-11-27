@@ -697,6 +697,10 @@ impl StackConfig {
         // check here — a stale `sndcp_service`/`advanced_link` flag must never make the station
         // fail to start (disabling a feature can't be fatal).
 
+        if let Some(proxy) = &self.cell.wap_proxy {
+            proxy.validate()?;
+        }
+
         // Validate timezone if configured
         if let Some(ref tz) = self.cell.timezone
             && tz.parse::<chrono_tz::Tz>().is_err()
